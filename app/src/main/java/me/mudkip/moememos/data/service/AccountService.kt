@@ -62,6 +62,20 @@ import java.util.zip.ZipOutputStream
 import javax.inject.Inject
 import javax.inject.Singleton
 
+enum class AccountExportStage {
+    PREPARING,
+    PROCESSING_MEMOS,
+    PROCESSING_ATTACHMENTS,
+    WRITING_OUTPUT,
+    COMPLETED,
+}
+
+data class AccountExportProgress(
+    val stage: AccountExportStage,
+    val completed: Int? = null,
+    val total: Int? = null,
+)
+
 @Singleton
 class AccountService @Inject constructor(
     @param:ApplicationContext private val context: Context,
@@ -256,7 +270,10 @@ class AccountService @Inject constructor(
         }
     }
 
-    suspend fun exportLocalAccountZip(destinationUri: Uri) {
+    suspend fun exportLocalAccountZip(
+        destinationUri: Uri,
+        onProgress: ((AccountExportProgress) -> Unit)? = null,
+    ) {
         withContext(Dispatchers.IO) {
             val accountKey = Account.Local().accountKey()
             val memoDao = database.memoDao()
@@ -267,18 +284,41 @@ class AccountService @Inject constructor(
             if (memos.isEmpty()) {
                 throw IllegalStateException("No local memos to export")
             }
+            val memoEntries = memos.map { memo ->
+                memo to memoDao.getMemoResources(memo.identifier, accountKey)
+                    .sortedWith(compareBy<ResourceEntity>({ it.filename }, { it.uri }))
+            }
+            val totalAttachmentCount = memoEntries.sumOf { (_, resources) -> resources.size }
+            var processedMemoCount = 0
+            var processedAttachmentCount = 0
+            onProgress?.invoke(
+                AccountExportProgress(
+                    stage = AccountExportStage.PREPARING,
+                )
+            )
+            onProgress?.invoke(
+                AccountExportProgress(
+                    stage = AccountExportStage.PROCESSING_MEMOS,
+                    completed = 0,
+                    total = memoEntries.size,
+                )
+            )
+            onProgress?.invoke(
+                AccountExportProgress(
+                    stage = AccountExportStage.PROCESSING_ATTACHMENTS,
+                    completed = 0,
+                    total = totalAttachmentCount,
+                )
+            )
 
             context.contentResolver.openOutputStream(destinationUri)?.use { output ->
                 ZipOutputStream(output).use { zip ->
                     val collisionMap = hashMapOf<String, Int>()
-                    for (memo in memos) {
+                    for ((memo, resources) in memoEntries) {
                         val memoBaseName = uniqueMemoBaseName(memo.date, collisionMap)
                         zip.putNextEntry(ZipEntry("$memoBaseName.md"))
                         zip.write(memo.content.toByteArray(Charsets.UTF_8))
                         zip.closeEntry()
-
-                        val resources = memoDao.getMemoResources(memo.identifier, accountKey)
-                            .sortedWith(compareBy<ResourceEntity>({ it.filename }, { it.uri }))
                         resources.forEachIndexed { index, resource ->
                             val sourceFile = localFileForResource(resource)
                                 ?: throw IllegalStateException("Missing resource file: ${resource.filename}")
@@ -294,14 +334,46 @@ class AccountService @Inject constructor(
                             zip.putNextEntry(ZipEntry(attachmentName))
                             sourceFile.inputStream().use { input -> input.copyTo(zip) }
                             zip.closeEntry()
+                            processedAttachmentCount += 1
+                            onProgress?.invoke(
+                                AccountExportProgress(
+                                    stage = AccountExportStage.PROCESSING_ATTACHMENTS,
+                                    completed = processedAttachmentCount,
+                                    total = totalAttachmentCount,
+                                )
+                            )
                         }
+                        processedMemoCount += 1
+                        onProgress?.invoke(
+                            AccountExportProgress(
+                                stage = AccountExportStage.PROCESSING_MEMOS,
+                                completed = processedMemoCount,
+                                total = memoEntries.size,
+                            )
+                        )
                     }
+                    onProgress?.invoke(
+                        AccountExportProgress(
+                            stage = AccountExportStage.WRITING_OUTPUT,
+                        )
+                    )
                 }
             } ?: throw IllegalStateException("Unable to open export destination")
+            onProgress?.invoke(
+                AccountExportProgress(
+                    stage = AccountExportStage.COMPLETED,
+                    completed = memoEntries.size,
+                    total = memoEntries.size,
+                )
+            )
         }
     }
 
-    suspend fun exportMemosAccountForKeerZip(accountKey: String, destinationUri: Uri) {
+    suspend fun exportMemosAccountForKeerZip(
+        accountKey: String,
+        destinationUri: Uri,
+        onProgress: ((AccountExportProgress) -> Unit)? = null,
+    ) {
         withContext(Dispatchers.IO) {
             awaitInitialization()
             val account = accounts.first().firstOrNull { it.accountKey() == accountKey }
@@ -314,6 +386,28 @@ class AccountService @Inject constructor(
             if (memos.isEmpty()) {
                 throw IllegalStateException("No personal memos to export")
             }
+            val totalAttachmentCount = memos.sumOf { memo -> memo.resources.size }
+            var processedMemoCount = 0
+            var processedAttachmentCount = 0
+            onProgress?.invoke(
+                AccountExportProgress(
+                    stage = AccountExportStage.PREPARING,
+                )
+            )
+            onProgress?.invoke(
+                AccountExportProgress(
+                    stage = AccountExportStage.PROCESSING_MEMOS,
+                    completed = 0,
+                    total = memos.size,
+                )
+            )
+            onProgress?.invoke(
+                AccountExportProgress(
+                    stage = AccountExportStage.PROCESSING_ATTACHMENTS,
+                    completed = 0,
+                    total = totalAttachmentCount,
+                )
+            )
 
             context.contentResolver.openOutputStream(destinationUri)?.use { output ->
                 ZipOutputStream(BufferedOutputStream(output)).use { zip ->
@@ -334,23 +428,48 @@ class AccountService @Inject constructor(
                                 filename = filename,
                                 mimeType = resource.mimeType,
                             )
+                            processedAttachmentCount += 1
+                            onProgress?.invoke(
+                                AccountExportProgress(
+                                    stage = AccountExportStage.PROCESSING_ATTACHMENTS,
+                                    completed = processedAttachmentCount,
+                                    total = totalAttachmentCount,
+                                )
+                            )
                         }
+                        val transformed = transformMemoForKeerExport(
+                            content = memo.content,
+                            originalTags = memo.tags,
+                        )
                         transferMemos += KeerMemoTransferMemo(
                             importId = buildRemoteMemoImportId(
                                 host = exportContext.host,
                                 userId = currentUserId,
                                 remoteMemoId = memo.remoteId,
                             ),
-                            content = memo.content,
+                            content = transformed.content,
                             createdAt = memo.date.toString(),
                             visibility = memo.visibility.name,
-                            tags = memo.tags,
+                            tags = transformed.tags,
                             pinned = memo.pinned,
                             archived = memo.archived,
                             attachments = transferAttachments,
                         )
+                        processedMemoCount += 1
+                        onProgress?.invoke(
+                            AccountExportProgress(
+                                stage = AccountExportStage.PROCESSING_MEMOS,
+                                completed = processedMemoCount,
+                                total = memos.size,
+                            )
+                        )
                     }
 
+                    onProgress?.invoke(
+                        AccountExportProgress(
+                            stage = AccountExportStage.WRITING_OUTPUT,
+                        )
+                    )
                     val document = KeerMemoTransferDocument(
                         exportedAt = Instant.now().toString(),
                         source = KeerMemoTransferSource(
@@ -366,6 +485,13 @@ class AccountService @Inject constructor(
                     zip.closeEntry()
                 }
             } ?: throw IllegalStateException("Unable to open export destination")
+            onProgress?.invoke(
+                AccountExportProgress(
+                    stage = AccountExportStage.COMPLETED,
+                    completed = memos.size,
+                    total = memos.size,
+                )
+            )
         }
     }
 

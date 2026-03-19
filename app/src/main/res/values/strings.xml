@@ -107,6 +107,11 @@
     <string name="export_for_keer">Export for Keer</string>
     <string name="keer_export_success">Exported successfully. You can now import this file in Keer.</string>
     <string name="keer_export_failed">Failed to export data for Keer</string>
+    <string name="export_progress_preparing">Preparing</string>
+    <string name="export_progress_processing_memos">Processing memos</string>
+    <string name="export_progress_processing_attachments">Processing attachments</string>
+    <string name="export_progress_writing_output">Writing export package</string>
+    <string name="export_progress_completed">Completed</string>
     
     <!-- Widget strings -->
     <string name="memos_widget_title">Memos</string>

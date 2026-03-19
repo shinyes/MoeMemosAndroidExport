@@ -11,16 +11,35 @@ import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import me.mudkip.moememos.data.api.MemosProfile
 import me.mudkip.moememos.data.api.MemosV0Api
 import me.mudkip.moememos.data.api.MemosV1Api
 import me.mudkip.moememos.data.model.Account
+import me.mudkip.moememos.data.service.AccountExportStage
 import me.mudkip.moememos.data.service.AccountService
+
+enum class AccountExportKind {
+    LOCAL,
+    KEER,
+}
+
+data class AccountExportTaskState(
+    val running: Boolean = false,
+    val kind: AccountExportKind? = null,
+    val stage: AccountExportStage? = null,
+    val completed: Int? = null,
+    val total: Int? = null,
+)
 
 @HiltViewModel(assistedFactory = AccountViewModel.AccountViewModelFactory::class)
 class AccountViewModel @AssistedInject constructor(
@@ -58,6 +77,9 @@ class AccountViewModel @AssistedInject constructor(
 
     var instanceProfile: MemosProfile? by mutableStateOf(null)
         private set
+    private val exportMutex = Mutex()
+    private val _exportTaskState = MutableStateFlow(AccountExportTaskState())
+    val exportTaskState: StateFlow<AccountExportTaskState> = _exportTaskState.asStateFlow()
 
     suspend fun loadInstanceProfile() = withContext(viewModelScope.coroutineContext) {
         when (val memosApi = memosApi.firstOrNull()) {
@@ -79,8 +101,27 @@ class AccountViewModel @AssistedInject constructor(
         if (selectedAccountKey != Account.Local().accountKey()) {
             return@withContext Result.failure(IllegalStateException("Export is available for local account only"))
         }
-        runCatching {
-            accountService.exportLocalAccountZip(destinationUri)
+        exportMutex.withLock {
+            _exportTaskState.value = AccountExportTaskState(
+                running = true,
+                kind = AccountExportKind.LOCAL,
+                stage = AccountExportStage.PREPARING,
+            )
+            try {
+                runCatching {
+                    accountService.exportLocalAccountZip(destinationUri) { progress ->
+                        _exportTaskState.value = AccountExportTaskState(
+                            running = true,
+                            kind = AccountExportKind.LOCAL,
+                            stage = progress.stage,
+                            completed = progress.completed,
+                            total = progress.total,
+                        )
+                    }
+                }
+            } finally {
+                _exportTaskState.value = AccountExportTaskState()
+            }
         }
     }
 
@@ -89,8 +130,30 @@ class AccountViewModel @AssistedInject constructor(
         if (account !is Account.MemosV0 && account !is Account.MemosV1) {
             return@withContext Result.failure(IllegalStateException("Keer export is available for remote Memos accounts only"))
         }
-        runCatching {
-            accountService.exportMemosAccountForKeerZip(selectedAccountKey, destinationUri)
+        exportMutex.withLock {
+            _exportTaskState.value = AccountExportTaskState(
+                running = true,
+                kind = AccountExportKind.KEER,
+                stage = AccountExportStage.PREPARING,
+            )
+            try {
+                runCatching {
+                    accountService.exportMemosAccountForKeerZip(
+                        selectedAccountKey,
+                        destinationUri
+                    ) { progress ->
+                        _exportTaskState.value = AccountExportTaskState(
+                            running = true,
+                            kind = AccountExportKind.KEER,
+                            stage = progress.stage,
+                            completed = progress.completed,
+                            total = progress.total,
+                        )
+                    }
+                }
+            } finally {
+                _exportTaskState.value = AccountExportTaskState()
+            }
         }
     }
 }

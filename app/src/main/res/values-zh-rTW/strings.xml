@@ -102,6 +102,11 @@
     <string name="export_for_keer">匯出到 Keer</string>
     <string name="keer_export_success">匯出成功，現在可以在 Keer 中匯入該檔案。</string>
     <string name="keer_export_failed">匯出到 Keer 失敗</string>
+    <string name="export_progress_preparing">正在準備</string>
+    <string name="export_progress_processing_memos">正在處理 memo</string>
+    <string name="export_progress_processing_attachments">正在處理附件</string>
+    <string name="export_progress_writing_output">正在寫入匯出檔案</string>
+    <string name="export_progress_completed">已完成</string>
     <string name="memos_widget_title">MEMO</string>
     <string name="memory_widget_title">回憶</string>
     <string name="memory_widget_description">顯示時間軸中的一則隨機 MEMO。</string>
