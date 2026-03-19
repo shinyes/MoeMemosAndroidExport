@@ -104,6 +104,9 @@
     <string name="export_local_account">Export Local Data</string>
     <string name="local_export_success">Local data exported</string>
     <string name="local_export_failed">Failed to export local data</string>
+    <string name="export_for_keer">Export for Keer</string>
+    <string name="keer_export_success">Exported successfully. You can now import this file in Keer.</string>
+    <string name="keer_export_failed">Failed to export data for Keer</string>
     
     <!-- Widget strings -->
     <string name="memos_widget_title">Memos</string>

@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.webkit.MimeTypeMap
 import androidx.core.net.toUri
+import com.skydoves.sandwich.ApiResponse
 import com.skydoves.sandwich.getOrNull
 import com.skydoves.sandwich.getOrThrow
 import com.skydoves.sandwich.retrofit.adapters.ApiResponseCallAdapterFactory
@@ -26,6 +27,8 @@ import me.mudkip.moememos.data.local.MoeMemosDatabase
 import me.mudkip.moememos.data.local.entity.ResourceEntity
 import me.mudkip.moememos.data.model.Account
 import me.mudkip.moememos.data.model.LocalAccount
+import me.mudkip.moememos.data.model.Memo
+import me.mudkip.moememos.data.model.Resource
 import me.mudkip.moememos.data.model.User
 import me.mudkip.moememos.data.model.UserData
 import me.mudkip.moememos.data.model.UserSettings
@@ -35,6 +38,7 @@ import me.mudkip.moememos.data.repository.MemosV0Repository
 import me.mudkip.moememos.data.repository.MemosV1Repository
 import me.mudkip.moememos.data.repository.RemoteRepository
 import me.mudkip.moememos.data.repository.SyncingRepository
+import me.mudkip.moememos.ext.getErrorMessage
 import me.mudkip.moememos.ext.string
 import me.mudkip.moememos.ext.settingsDataStore
 import net.swiftzer.semver.SemVer
@@ -42,9 +46,12 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
+import java.io.BufferedOutputStream
 import java.io.File
+import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -81,6 +88,14 @@ class AccountService @Inject constructor(
     private data class ServerVersionInfo(
         val accountCase: UserData.AccountCase,
         val version: String,
+    )
+
+    private data class RemoteExportContext(
+        val accountKey: String,
+        val host: String,
+        val displayName: String,
+        val httpClient: OkHttpClient,
+        val repository: RemoteRepository,
     )
 
     private enum class VersionPolicy {
@@ -283,11 +298,239 @@ class AccountService @Inject constructor(
         } ?: throw IllegalStateException("Unable to open export destination")
     }
 
+    suspend fun exportMemosAccountForKeerZip(accountKey: String, destinationUri: Uri) {
+        awaitInitialization()
+        val account = accounts.first().firstOrNull { it.accountKey() == accountKey }
+            ?: throw IllegalStateException("Account not found")
+        val exportContext = buildRemoteExportContext(account)
+        val currentUser = requireSuccess(exportContext.repository.getCurrentUser())
+        val currentUserId = normalizeUserIdentifier(currentUser.identifier)
+            .ifEmpty { normalizeUserIdentifier(exportContext.displayName) }
+        val memos = loadPersonalRemoteMemos(exportContext.repository, currentUserId)
+        if (memos.isEmpty()) {
+            throw IllegalStateException("No personal memos to export")
+        }
+
+        context.contentResolver.openOutputStream(destinationUri)?.use { output ->
+            ZipOutputStream(BufferedOutputStream(output)).use { zip ->
+                val transferMemos = mutableListOf<KeerMemoTransferMemo>()
+                memos.forEachIndexed { memoIndex, memo ->
+                    val transferAttachments = mutableListOf<KeerMemoTransferAttachment>()
+                    memo.resources.forEachIndexed { attachmentIndex, resource ->
+                        val filename = resolveTransferAttachmentFilename(resource.filename, attachmentIndex)
+                        val entryPath = buildTransferAttachmentEntryPath(memoIndex, attachmentIndex, filename)
+                        writeRemoteResourceToTransferZip(
+                            zip = zip,
+                            entryPath = entryPath,
+                            resource = resource,
+                            exportContext = exportContext,
+                        )
+                        transferAttachments += KeerMemoTransferAttachment(
+                            path = entryPath,
+                            filename = filename,
+                            mimeType = resource.mimeType,
+                        )
+                    }
+                    transferMemos += KeerMemoTransferMemo(
+                        importId = buildRemoteMemoImportId(
+                            host = exportContext.host,
+                            userId = currentUserId,
+                            remoteMemoId = memo.remoteId,
+                        ),
+                        content = memo.content,
+                        createdAt = memo.date.toString(),
+                        visibility = memo.visibility.name,
+                        tags = memo.tags,
+                        pinned = memo.pinned,
+                        archived = memo.archived,
+                        attachments = transferAttachments,
+                    )
+                }
+
+                val document = KeerMemoTransferDocument(
+                    exportedAt = Instant.now().toString(),
+                    source = KeerMemoTransferSource(
+                        host = exportContext.host,
+                        userId = currentUserId.ifBlank { null },
+                        username = currentUser.name.ifBlank { exportContext.displayName }.ifBlank { null },
+                    ),
+                    memos = transferMemos,
+                )
+                val payload = KeerMemoTransferCodec.encode(document)
+                zip.putNextEntry(ZipEntry(keerTransferManifestEntryName))
+                zip.write(payload.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+        } ?: throw IllegalStateException("Unable to open export destination")
+    }
+
     private fun uniqueMemoBaseName(date: Instant, collisionMap: MutableMap<String, Int>): String {
         val base = exportDateFormatter.format(date)
         val count = collisionMap[base] ?: 0
         collisionMap[base] = count + 1
         return if (count == 0) base else "${base}_$count"
+    }
+
+    private fun buildRemoteExportContext(account: Account): RemoteExportContext {
+        return when (account) {
+            is Account.MemosV0 -> {
+                val (client, api) = createMemosV0Client(account.info.host, account.info.accessToken)
+                RemoteExportContext(
+                    accountKey = account.accountKey(),
+                    host = account.info.host,
+                    displayName = account.info.name,
+                    httpClient = client,
+                    repository = MemosV0Repository(api, account),
+                )
+            }
+            is Account.MemosV1 -> {
+                val (client, api) = createMemosV1Client(account.info.host, account.info.accessToken)
+                RemoteExportContext(
+                    accountKey = account.accountKey(),
+                    host = account.info.host,
+                    displayName = account.info.name,
+                    httpClient = client,
+                    repository = MemosV1Repository(api, account),
+                )
+            }
+            is Account.Local -> {
+                throw IllegalStateException("Keer export is only available for remote Memos accounts")
+            }
+        }
+    }
+
+    private suspend fun loadPersonalRemoteMemos(
+        repository: RemoteRepository,
+        currentUserId: String,
+    ): List<Memo> {
+        val activeMemos = requireSuccess(repository.listMemos())
+        val archivedMemos = requireSuccess(repository.listArchivedMemos())
+        val merged = LinkedHashMap<String, Memo>()
+        (activeMemos + archivedMemos).forEach { memo ->
+            merged[memo.remoteId] = memo
+        }
+        val candidates = merged.values.map { memo ->
+            memo to memo.creator?.identifier?.let(::normalizeUserIdentifier).orEmpty()
+        }
+        val hasCreatorInfo = candidates.any { (_, creatorId) -> creatorId.isNotEmpty() }
+        return candidates
+            .asSequence()
+            .filter { (_, creatorId) ->
+                if (hasCreatorInfo && currentUserId.isNotBlank()) creatorId == currentUserId else true
+            }
+            .map { (memo, _) -> memo }
+            .sortedByDescending(Memo::date)
+            .toList()
+    }
+
+    private suspend fun writeRemoteResourceToTransferZip(
+        zip: ZipOutputStream,
+        entryPath: String,
+        resource: Resource,
+        exportContext: RemoteExportContext,
+    ) {
+        if (writeCachedResourceToTransferZip(zip, entryPath, resource, exportContext.accountKey)) {
+            return
+        }
+        val request = Request.Builder()
+            .url(resource.uri)
+            .get()
+            .build()
+        exportContext.httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("Failed to download attachment (${response.code}): ${resource.filename}")
+            }
+            val body = response.body
+            zip.putNextEntry(ZipEntry(entryPath))
+            body.byteStream().use { input ->
+                input.copyTo(zip)
+            }
+            zip.closeEntry()
+        }
+    }
+
+    private suspend fun writeCachedResourceToTransferZip(
+        zip: ZipOutputStream,
+        entryPath: String,
+        resource: Resource,
+        accountKey: String,
+    ): Boolean {
+        val localResource = database.memoDao().getResourceByRemoteId(resource.remoteId, accountKey)
+            ?: return false
+        val localFile = localFileForResource(localResource)
+            ?: return false
+        if (!localFile.exists() || localFile.length() <= 0L) {
+            return false
+        }
+        zip.putNextEntry(ZipEntry(entryPath))
+        localFile.inputStream().buffered().use { input ->
+            input.copyTo(zip)
+        }
+        zip.closeEntry()
+        return true
+    }
+
+    private fun resolveTransferAttachmentFilename(rawFilename: String, attachmentIndex: Int): String {
+        val trimmed = rawFilename.trim()
+        if (trimmed.isNotEmpty()) {
+            return trimmed
+        }
+        return "attachment-${attachmentIndex + 1}.bin"
+    }
+
+    private fun buildTransferAttachmentEntryPath(
+        memoIndex: Int,
+        attachmentIndex: Int,
+        filename: String,
+    ): String {
+        val memoSegment = (memoIndex + 1).toString().padStart(4, '0')
+        val attachmentSegment = (attachmentIndex + 1).toString().padStart(3, '0')
+        return "$keerTransferAttachmentsPrefix/memo-$memoSegment/$attachmentSegment-${filename.sanitizeTransferFilename()}"
+    }
+
+    private fun String.sanitizeTransferFilename(): String {
+        val sanitized = replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return sanitized.ifEmpty { "attachment.bin" }
+    }
+
+    private fun normalizeUserIdentifier(raw: String): String {
+        return raw.trim()
+            .substringBefore('|')
+            .substringAfterLast('/')
+            .trim()
+    }
+
+    private fun buildRemoteMemoImportId(host: String, userId: String, remoteMemoId: String): String {
+        val raw = listOf(
+            host.trim(),
+            userId.trim(),
+            remoteMemoId.trim(),
+        ).joinToString("\u001f")
+        return "moememos:$keerTransferImportIdVersion:${sha256(raw)}"
+    }
+
+    private fun sha256(text: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
+        return buildString(bytes.size * 2) {
+            bytes.forEach { byte ->
+                val value = byte.toInt() and 0xFF
+                append(hex[value ushr 4])
+                append(hex[value and 0x0F])
+            }
+        }
+    }
+
+    private fun <T> requireSuccess(response: ApiResponse<T>): T {
+        return when (response) {
+            is ApiResponse.Success -> response.data
+            is ApiResponse.Failure.Error -> {
+                val message = response.getErrorMessage().ifBlank { "Request failed" }
+                throw IllegalStateException(message)
+            }
+            is ApiResponse.Failure.Exception -> throw response.throwable
+        }
     }
 
     private fun localFileForResource(resource: ResourceEntity): File? {
@@ -610,5 +853,9 @@ class AccountService @Inject constructor(
         private val MEMOS_V0_MIN_VERSION = SemVer(0, 21, 0)
         private val MEMOS_V1_MIN_VERSION = SemVer(0, 26, 0)
         private val MEMOS_V1_MAX_VERSION = SemVer(0, 26, 2)
+        private const val keerTransferManifestEntryName = "manifest.json"
+        private const val keerTransferAttachmentsPrefix = "attachments"
+        private const val keerTransferImportIdVersion = "v1"
+        private const val hex = "0123456789abcdef"
     }
 }

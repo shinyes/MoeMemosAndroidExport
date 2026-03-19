@@ -99,6 +99,9 @@
     <string name="export_local_account">导出本地数据</string>
     <string name="local_export_success">本地数据已导出</string>
     <string name="local_export_failed">导出本地数据失败</string>
+    <string name="export_for_keer">导出到 Keer</string>
+    <string name="keer_export_success">导出成功，现在可以在 Keer 中导入该文件。</string>
+    <string name="keer_export_failed">导出到 Keer 失败</string>
     <string name="memos_widget_title">MEMO</string>
     <string name="memory_widget_title">回忆</string>
     <string name="memory_widget_description">显示时间线中的一条随机 MEMO。</string>

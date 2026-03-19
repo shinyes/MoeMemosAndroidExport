@@ -83,4 +83,14 @@ class AccountViewModel @AssistedInject constructor(
             accountService.exportLocalAccountZip(destinationUri)
         }
     }
+
+    suspend fun exportSelectedAccountForKeer(destinationUri: Uri): Result<Unit> = withContext(viewModelScope.coroutineContext) {
+        val account = selectedAccountState.value
+        if (account !is Account.MemosV0 && account !is Account.MemosV1) {
+            return@withContext Result.failure(IllegalStateException("Keer export is available for remote Memos accounts only"))
+        }
+        runCatching {
+            accountService.exportMemosAccountForKeerZip(selectedAccountKey, destinationUri)
+        }
+    }
 }

@@ -67,6 +67,20 @@ fun AccountPage(
             }
         }
     }
+    val exportForKeerLauncher = rememberLauncherForActivityResult(CreateDocument("application/zip")) { uri ->
+        if (uri == null) {
+            return@rememberLauncherForActivityResult
+        }
+        coroutineScope.launch {
+            val result = viewModel.exportSelectedAccountForKeer(uri)
+            result.onSuccess {
+                Toast.makeText(navController.context, R.string.keer_export_success.string, Toast.LENGTH_SHORT).show()
+            }.onFailure { error ->
+                val message = error.localizedMessage ?: R.string.keer_export_failed.string
+                Toast.makeText(navController.context, message, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -113,6 +127,10 @@ fun AccountPage(
                                 navController.popBackStackIfLifecycleIsResumed(lifecycleOwner)
                             }
                     }
+                },
+                onExportForKeer = {
+                    val filename = "MoeMemos-To-Keer-${exportTimestamp(Instant.now())}.zip"
+                    exportForKeerLauncher.launch(filename)
                 },
                 onSignOut = {
                     coroutineScope.launch {

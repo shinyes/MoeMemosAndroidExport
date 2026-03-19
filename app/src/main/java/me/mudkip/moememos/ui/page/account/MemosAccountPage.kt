@@ -44,6 +44,7 @@ fun MemosAccountPage(
     okHttpClient: OkHttpClient,
     showSwitchAccountButton: Boolean,
     onSwitchAccount: () -> Unit,
+    onExportForKeer: () -> Unit,
     onSignOut: () -> Unit
 ) {
     val context = LocalContext.current
@@ -136,6 +137,18 @@ fun MemosAccountPage(
                 ) {
                     Text(R.string.switch_account.string)
                 }
+            }
+        }
+
+        item {
+            FilledTonalButton(
+                onClick = onExportForKeer,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 20.dp, end = 20.dp, bottom = 10.dp),
+                contentPadding = PaddingValues(10.dp)
+            ) {
+                Text(R.string.export_for_keer.string)
             }
         }
 
