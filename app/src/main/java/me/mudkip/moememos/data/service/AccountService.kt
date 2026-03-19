@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import me.mudkip.moememos.R
 import me.mudkip.moememos.data.api.MemosV0Api
@@ -256,112 +257,116 @@ class AccountService @Inject constructor(
     }
 
     suspend fun exportLocalAccountZip(destinationUri: Uri) {
-        val accountKey = Account.Local().accountKey()
-        val memoDao = database.memoDao()
-        val memos = memoDao.getAllMemosForSync(accountKey)
-            .filterNot { it.isDeleted }
-            .sortedWith(compareBy({ it.date }, { it.content }))
+        withContext(Dispatchers.IO) {
+            val accountKey = Account.Local().accountKey()
+            val memoDao = database.memoDao()
+            val memos = memoDao.getAllMemosForSync(accountKey)
+                .filterNot { it.isDeleted }
+                .sortedWith(compareBy({ it.date }, { it.content }))
 
-        if (memos.isEmpty()) {
-            throw IllegalStateException("No local memos to export")
-        }
+            if (memos.isEmpty()) {
+                throw IllegalStateException("No local memos to export")
+            }
 
-        context.contentResolver.openOutputStream(destinationUri)?.use { output ->
-            ZipOutputStream(output).use { zip ->
-                val collisionMap = hashMapOf<String, Int>()
-                for (memo in memos) {
-                    val memoBaseName = uniqueMemoBaseName(memo.date, collisionMap)
-                    zip.putNextEntry(ZipEntry("$memoBaseName.md"))
-                    zip.write(memo.content.toByteArray(Charsets.UTF_8))
-                    zip.closeEntry()
-
-                    val resources = memoDao.getMemoResources(memo.identifier, accountKey)
-                        .sortedWith(compareBy<ResourceEntity>({ it.filename }, { it.uri }))
-                    resources.forEachIndexed { index, resource ->
-                        val sourceFile = localFileForResource(resource)
-                            ?: throw IllegalStateException("Missing resource file: ${resource.filename}")
-                        if (!sourceFile.exists()) {
-                            throw IllegalStateException("Missing resource file: ${resource.filename}")
-                        }
-                        val ext = exportFileExtension(resource, sourceFile)
-                        val attachmentName = if (ext.isBlank()) {
-                            "$memoBaseName-${index + 1}"
-                        } else {
-                            "$memoBaseName-${index + 1}.$ext"
-                        }
-                        zip.putNextEntry(ZipEntry(attachmentName))
-                        sourceFile.inputStream().use { input -> input.copyTo(zip) }
+            context.contentResolver.openOutputStream(destinationUri)?.use { output ->
+                ZipOutputStream(output).use { zip ->
+                    val collisionMap = hashMapOf<String, Int>()
+                    for (memo in memos) {
+                        val memoBaseName = uniqueMemoBaseName(memo.date, collisionMap)
+                        zip.putNextEntry(ZipEntry("$memoBaseName.md"))
+                        zip.write(memo.content.toByteArray(Charsets.UTF_8))
                         zip.closeEntry()
+
+                        val resources = memoDao.getMemoResources(memo.identifier, accountKey)
+                            .sortedWith(compareBy<ResourceEntity>({ it.filename }, { it.uri }))
+                        resources.forEachIndexed { index, resource ->
+                            val sourceFile = localFileForResource(resource)
+                                ?: throw IllegalStateException("Missing resource file: ${resource.filename}")
+                            if (!sourceFile.exists()) {
+                                throw IllegalStateException("Missing resource file: ${resource.filename}")
+                            }
+                            val ext = exportFileExtension(resource, sourceFile)
+                            val attachmentName = if (ext.isBlank()) {
+                                "$memoBaseName-${index + 1}"
+                            } else {
+                                "$memoBaseName-${index + 1}.$ext"
+                            }
+                            zip.putNextEntry(ZipEntry(attachmentName))
+                            sourceFile.inputStream().use { input -> input.copyTo(zip) }
+                            zip.closeEntry()
+                        }
                     }
                 }
-            }
-        } ?: throw IllegalStateException("Unable to open export destination")
+            } ?: throw IllegalStateException("Unable to open export destination")
+        }
     }
 
     suspend fun exportMemosAccountForKeerZip(accountKey: String, destinationUri: Uri) {
-        awaitInitialization()
-        val account = accounts.first().firstOrNull { it.accountKey() == accountKey }
-            ?: throw IllegalStateException("Account not found")
-        val exportContext = buildRemoteExportContext(account)
-        val currentUser = requireSuccess(exportContext.repository.getCurrentUser())
-        val currentUserId = normalizeUserIdentifier(currentUser.identifier)
-            .ifEmpty { normalizeUserIdentifier(exportContext.displayName) }
-        val memos = loadPersonalRemoteMemos(exportContext.repository, currentUserId)
-        if (memos.isEmpty()) {
-            throw IllegalStateException("No personal memos to export")
-        }
+        withContext(Dispatchers.IO) {
+            awaitInitialization()
+            val account = accounts.first().firstOrNull { it.accountKey() == accountKey }
+                ?: throw IllegalStateException("Account not found")
+            val exportContext = buildRemoteExportContext(account)
+            val currentUser = requireSuccess(exportContext.repository.getCurrentUser())
+            val currentUserId = normalizeUserIdentifier(currentUser.identifier)
+                .ifEmpty { normalizeUserIdentifier(exportContext.displayName) }
+            val memos = loadPersonalRemoteMemos(exportContext.repository, currentUserId)
+            if (memos.isEmpty()) {
+                throw IllegalStateException("No personal memos to export")
+            }
 
-        context.contentResolver.openOutputStream(destinationUri)?.use { output ->
-            ZipOutputStream(BufferedOutputStream(output)).use { zip ->
-                val transferMemos = mutableListOf<KeerMemoTransferMemo>()
-                memos.forEachIndexed { memoIndex, memo ->
-                    val transferAttachments = mutableListOf<KeerMemoTransferAttachment>()
-                    memo.resources.forEachIndexed { attachmentIndex, resource ->
-                        val filename = resolveTransferAttachmentFilename(resource.filename, attachmentIndex)
-                        val entryPath = buildTransferAttachmentEntryPath(memoIndex, attachmentIndex, filename)
-                        writeRemoteResourceToTransferZip(
-                            zip = zip,
-                            entryPath = entryPath,
-                            resource = resource,
-                            exportContext = exportContext,
-                        )
-                        transferAttachments += KeerMemoTransferAttachment(
-                            path = entryPath,
-                            filename = filename,
-                            mimeType = resource.mimeType,
+            context.contentResolver.openOutputStream(destinationUri)?.use { output ->
+                ZipOutputStream(BufferedOutputStream(output)).use { zip ->
+                    val transferMemos = mutableListOf<KeerMemoTransferMemo>()
+                    memos.forEachIndexed { memoIndex, memo ->
+                        val transferAttachments = mutableListOf<KeerMemoTransferAttachment>()
+                        memo.resources.forEachIndexed { attachmentIndex, resource ->
+                            val filename = resolveTransferAttachmentFilename(resource.filename, attachmentIndex)
+                            val entryPath = buildTransferAttachmentEntryPath(memoIndex, attachmentIndex, filename)
+                            writeRemoteResourceToTransferZip(
+                                zip = zip,
+                                entryPath = entryPath,
+                                resource = resource,
+                                exportContext = exportContext,
+                            )
+                            transferAttachments += KeerMemoTransferAttachment(
+                                path = entryPath,
+                                filename = filename,
+                                mimeType = resource.mimeType,
+                            )
+                        }
+                        transferMemos += KeerMemoTransferMemo(
+                            importId = buildRemoteMemoImportId(
+                                host = exportContext.host,
+                                userId = currentUserId,
+                                remoteMemoId = memo.remoteId,
+                            ),
+                            content = memo.content,
+                            createdAt = memo.date.toString(),
+                            visibility = memo.visibility.name,
+                            tags = memo.tags,
+                            pinned = memo.pinned,
+                            archived = memo.archived,
+                            attachments = transferAttachments,
                         )
                     }
-                    transferMemos += KeerMemoTransferMemo(
-                        importId = buildRemoteMemoImportId(
-                            host = exportContext.host,
-                            userId = currentUserId,
-                            remoteMemoId = memo.remoteId,
-                        ),
-                        content = memo.content,
-                        createdAt = memo.date.toString(),
-                        visibility = memo.visibility.name,
-                        tags = memo.tags,
-                        pinned = memo.pinned,
-                        archived = memo.archived,
-                        attachments = transferAttachments,
-                    )
-                }
 
-                val document = KeerMemoTransferDocument(
-                    exportedAt = Instant.now().toString(),
-                    source = KeerMemoTransferSource(
-                        host = exportContext.host,
-                        userId = currentUserId.ifBlank { null },
-                        username = currentUser.name.ifBlank { exportContext.displayName }.ifBlank { null },
-                    ),
-                    memos = transferMemos,
-                )
-                val payload = KeerMemoTransferCodec.encode(document)
-                zip.putNextEntry(ZipEntry(keerTransferManifestEntryName))
-                zip.write(payload.toByteArray(Charsets.UTF_8))
-                zip.closeEntry()
-            }
-        } ?: throw IllegalStateException("Unable to open export destination")
+                    val document = KeerMemoTransferDocument(
+                        exportedAt = Instant.now().toString(),
+                        source = KeerMemoTransferSource(
+                            host = exportContext.host,
+                            userId = currentUserId.ifBlank { null },
+                            username = currentUser.name.ifBlank { exportContext.displayName }.ifBlank { null },
+                        ),
+                        memos = transferMemos,
+                    )
+                    val payload = KeerMemoTransferCodec.encode(document)
+                    zip.putNextEntry(ZipEntry(keerTransferManifestEntryName))
+                    zip.write(payload.toByteArray(Charsets.UTF_8))
+                    zip.closeEntry()
+                }
+            } ?: throw IllegalStateException("Unable to open export destination")
+        }
     }
 
     private fun uniqueMemoBaseName(date: Instant, collisionMap: MutableMap<String, Int>): String {
@@ -432,13 +437,20 @@ class AccountService @Inject constructor(
         if (writeCachedResourceToTransferZip(zip, entryPath, resource, exportContext.accountKey)) {
             return
         }
+        val attachmentLabel = resource.filename.ifBlank { resource.remoteId.ifBlank { "unknown" } }
         val request = Request.Builder()
             .url(resource.uri)
             .get()
             .build()
         exportContext.httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
-                throw IllegalStateException("Failed to download attachment (${response.code}): ${resource.filename}")
+                throw IllegalStateException("Failed to download attachment \"$attachmentLabel\" (${response.code})")
+            }
+            @Suppress("SENSELESS_COMPARISON")
+            if (response.body == null) {
+                throw IllegalStateException(
+                    "Attachment response body is empty for \"$attachmentLabel\" (${response.code})"
+                )
             }
             val body = response.body
             zip.putNextEntry(ZipEntry(entryPath))
